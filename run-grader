@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+import os
+import sys
+import string
+import itertools
+import json
+import requests
+from pathlib import Path
+
+from eth10M import decode
+
+
+def main():
+    correct = 0
+    for i in range(100):
+        pdu = f'pdu{i:02d}'
+        with open(Path('testcases', pdu), 'r') as f:
+            sig = [int(s.strip()) for s in f]
+        with open(Path('testcases', f'{pdu}.dec'), 'rb') as f:
+            expected_dec = f.read()
+
+        dec = decode(sig)
+
+        if dec == expected_dec:
+            correct += 1
+        else:
+            print(f'\n\n==> INCORRECT DECODE FOR {pdu}')
+            bindiff(dec, expected_dec)
+
+    print('\n\n')
+    print(json.dumps({'scores': {'testcases': correct/10.}}))
+    notify()
+
+
+printables = set(string.printable) - set('\r\n\t\f')
+
+
+def bindiff(A: bytes, B: bytes):
+    def print_cols(X: bytes, Y: bytes, N=8):
+        def highlight(cond, x): return f'\033[31;1m{x}\033[0m' if cond else x
+        for x, y, _ in itertools.zip_longest(X, Y, N*[None]):
+            sys.stdout.write(
+                highlight(x != y, f'{x:02x} ' if x is not None else '   '))
+        sys.stdout.write(' ')
+        for x, y, _ in itertools.zip_longest(X, Y, N*[None]):
+            c = chr(x) if x is not None else None
+            sys.stdout.write(highlight(
+                x != y, f'{c if c in printables else "."}' if c is not None else ' '))
+    L = max(len(A), len(B))
+    for i in range(0, L, 8):
+        print_cols(A[i:i+8], B[i:i+8])
+        sys.stdout.write('     ')
+        print_cols(B[i:i+8], A[i:i+8])
+        sys.stdout.write('\n')
+
+
+def notify():
+    if not os.getenv('GITHUB_TOKEN'):
+        # não notificar se não estiver dentro do GitHub CI
+        return
+    r = requests.post(
+        'https://script.google.com/macros/s/AKfycbxpNSe_XcKYWRr9dIOvbYhd8sZATdlXlHM3_78Wk0rjgGx6uRGg2UJFVSFVDU3zdb0l/exec',
+        json={'repo': os.getenv('GITHUB_REPOSITORY'),
+              'token': os.getenv('GITHUB_TOKEN'),
+              'run_id': os.getenv('GITHUB_RUN_ID'),
+              })
+    print(r)
+    print(r.text)
+
+
+if __name__ == '__main__':
+    main()
