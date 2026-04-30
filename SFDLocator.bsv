@@ -9,7 +9,9 @@ module mkSFDLocator(FrameBitProcessor);
 
     interface Put in;
         method Action put(Maybe#(Bit#(1)) in);
-            // TODO: your code here
+            // TODO: suppress the Ethernet preamble and SFD, then forward only the
+            // frame bits after the SFD.  Invalid marks the end of a frame and
+            // should be propagated after resetting locator state.
         endmethod
     endinterface
     interface out = toGet(outFifo);

@@ -9,7 +9,9 @@ module mkManchesterDecoder(FrameBitProcessor);
 
     interface Put in;
         method Action put(Maybe#(Bit#(1)) in);
-            // TODO: your code here
+            // TODO: decode the Manchester stream produced by FrameDelimiter.
+            // Valid inputs are samples from inside a frame; Invalid marks the end
+            // of a frame and should be propagated after resetting decoder state.
         endmethod
     endinterface
     interface out = toGet(outFifo);

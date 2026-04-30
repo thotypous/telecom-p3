@@ -1,104 +1,342 @@
 #!/usr/bin/env python3
-import os
+import base64
 import json
-import requests
-from subprocess import Popen, PIPE
-from threading import Timer
+import math
+import os
+import sys
+import time
+import uuid
+from subprocess import DEVNULL, PIPE, TimeoutExpired, run
 
 
-def run_tests():
-    tests = [
-        ('ManchesterDecoder', 'testcases.in', 'testcases.sfd', 4, 10),
-        ('SFDLocator', 'testcases.sfd', 'testcases.out', 4, 10),
-    ]
-    scores = {}
+STREAM_TESTS = [
+    ('ManchesterDecoder', 'testcases.in', 'testcases.sfd', 2, 10),
+    ('SFDLocator', 'testcases.sfd', 'testcases.out', 2, 10),
+]
 
-    os.system('make clean')
-    if os.system('make') != 0:
-        print('ABORTANDO TESTES: falha ao sintetizar! '
-              'Certifique-se que não há erros de compilação e que sua lógica '
-              'consegue executar rápido o suficiente com relação ao clock '
-              'fornecido.')
-        return {}
-
-    for test, in_filename, out_filename, weight, timeout in tests:
-        test_bin = f'Test{test}.exe'
-        scores[test] = 0
-
-        p = Popen(['make', test_bin], encoding='utf-8')
-        if p.wait() != 0:
-            print(f"FALHA AO COMPILAR: pulando teste '{test}'.")
-            continue
-
-        print(f'Executando ./{test_bin}...')
-        with open(in_filename) as f:
-            p = Popen([f'./{test_bin}'],
-                      encoding='utf-8',
-                      stdin=f,
-                      stdout=PIPE)
-
-        def timeout_handler():
-            print(f"TIMEOUT: o teste demorou mais que o limite de {timeout} segundos")
-            p.kill()
-        timer = Timer(timeout, timeout_handler)
-        try:
-            timer.start()
-
-            assert p.stdout is not None
-
-            with open(out_filename) as f:
-                expected = ''.join(s.strip() for s in f)
-            obtained = ''.join(s.strip() for s in p.stdout if 'Verilog $finish' not in s)
-
-            min_len = min(len(expected), len(obtained))
-            for i, (x, y) in enumerate(zip(expected, obtained)):
-                if x != y:
-                    context_start = max(0, i - 8)
-                    context_end = min(min_len - 1, i + 8)
-                    print(f'DIFFERENCE at position {i+1}')
-                    print(f'Expected: {expected[context_start:context_end]}')
-                    print(f'Obtained: {obtained[context_start:context_end]}')
-                    print(f'          {' '*(i-context_start)}^')
-                    break
-            else:
-                expected_tail = expected[min_len:]
-                obtained_tail = obtained[min_len:]
-                if expected_tail != '':
-                    print(f'MISSING DATA at the end: {expected_tail}')
-                if obtained_tail != '':
-                    print(f'EXCESS DATA at the end: {obtained_tail}')
-
-            if p.wait() == 0:
-                if expected == obtained:
-                    print("OK")
-                    scores[test] = weight
-                else:
-                    print("FAIL")
-                    scores[test] = 0
-        finally:
-            timer.cancel()
-
-    return scores
-
-
-def notify():
-    if not os.getenv('GITHUB_TOKEN'):
-        # não notificar se não estiver dentro do GitHub CI
-        return
-    r = requests.post(
-        'https://script.google.com/macros/s/AKfycbwxRL2ZxtEtxW2ULYUrdk_7zpvMJAnypABdPflMzPTAPDD3n9zCnCiX88V5S2VYT3T64A/exec',
-        json={'repo': os.getenv('GITHUB_REPOSITORY'),
-              'token': os.getenv('GITHUB_TOKEN'),
-              'run_id': os.getenv('GITHUB_RUN_ID'),
-              })
-    print(r)
-    print(r.text)
+BINARY_TESTS = [
+    ('EthernetTxManchester', 2, 10),
+    ('EthernetTxChannelSensing', 1, 10),
+    ('EthernetTxCollisionBackoff', 1, 10),
+]
 
 
 def main():
-    scores = run_tests()
-    print(json.dumps({'scores': scores}))
-    notify()
+    result = run_tests()
+    if not os.getenv('GITHUB_OUTPUT'):
+        print(json.dumps(result, indent=2), flush=True)
+    set_output('result', base64.b64encode(json.dumps(result).encode('utf-8')).decode('ascii'))
+    if result['status'] == 'error':
+        sys.exit(1)
+
+
+def run_tests():
+    tests = STREAM_TESTS + BINARY_TESTS
+    results = []
+
+    run(['make', 'clean'], stdout=DEVNULL, stderr=DEVNULL, check=False)
+    if run(['make'], check=False).returncode != 0:
+        print('ABORTANDO TESTES: falha ao sintetizar! '
+              'Certifique-se que não há erros de compilação e que sua lógica '
+              'consegue executar rápido o suficiente com relação ao clock '
+              'fornecido.', flush=True)
+        return generate_result(
+            'error',
+            tests,
+            [generate_test_result(
+                name='Synthesis',
+                status='error',
+                score=0,
+                max_score=max_score(tests),
+                message='Falha ao sintetizar o projeto.',
+                test_code='make',
+                duration=0,
+                raw_score=0,
+            )],
+        )
+
+    for test, in_filename, out_filename, weight, timeout in STREAM_TESTS:
+        results.append(run_stream_test(test, in_filename, out_filename, weight, timeout))
+
+    for test, weight, timeout in BINARY_TESTS:
+        results.append(run_binary_test(test, weight, timeout))
+
+    return generate_result(overall_status(results), tests, with_integer_scores(results))
+
+
+def run_stream_test(test, in_filename, out_filename, weight, timeout):
+    test_bin = f'Test{test}.exe'
+    compile_start = time.monotonic()
+
+    if run(['make', test_bin], check=False).returncode != 0:
+        print(f"FALHA AO COMPILAR: pulando teste '{test}'.", flush=True)
+        return generate_test_result(
+            name=test,
+            status='error',
+            score=0,
+            max_score=weight,
+            message=f'Falha ao compilar {test_bin}.',
+            test_code=f'make {test_bin}',
+            duration=elapsed_ms(compile_start),
+            raw_score=0,
+        )
+
+    print(f'Executando ./{test_bin}...', flush=True)
+    start_time = time.monotonic()
+    try:
+        with open(in_filename, encoding='utf-8') as input_file:
+            completed = run(
+                [f'./{test_bin}'],
+                stdin=input_file,
+                stdout=PIPE,
+                encoding='utf-8',
+                timeout=timeout,
+                check=False,
+            )
+        duration = elapsed_ms(start_time)
+    except TimeoutExpired:
+        duration = elapsed_ms(start_time)
+        print(f"TIMEOUT: o teste demorou mais que o limite de {timeout} segundos", flush=True)
+        return generate_test_result(
+            name=test,
+            status='error',
+            score=0,
+            max_score=weight,
+            message=f'Timeout apos {timeout} segundos.',
+            test_code=f'./{test_bin} < {in_filename}',
+            duration=duration,
+            raw_score=0,
+        )
+
+    expected = read_stream(out_filename)
+    obtained = ''.join(
+        line.strip()
+        for line in completed.stdout.splitlines()
+        if 'Verilog $finish' not in line
+    )
+    matched, total = stream_match_count(expected, obtained)
+    raw_score = weight * matched / total if total else weight
+
+    if completed.returncode != 0:
+        print('FAIL', flush=True)
+        status = 'error'
+        message = 'Simulacao terminou com erro.'
+        raw_score = 0
+    elif expected == obtained:
+        print('OK', flush=True)
+        status = 'pass'
+        message = 'OK'
+    else:
+        print('PARTIAL', flush=True)
+        status = 'fail'
+        message = stream_difference_message(expected, obtained, matched, total, raw_score, weight)
+
+    return generate_test_result(
+        name=test,
+        status=status,
+        score=raw_score,
+        max_score=weight,
+        message=message,
+        test_code=f'./{test_bin} < {in_filename}',
+        duration=duration,
+        raw_score=raw_score,
+    )
+
+
+def run_binary_test(test, weight, timeout):
+    test_bin = f'Test{test}.exe'
+    compile_start = time.monotonic()
+
+    if run(['make', test_bin], check=False).returncode != 0:
+        print(f"FALHA AO COMPILAR: pulando teste '{test}'.", flush=True)
+        return generate_test_result(
+            name=test,
+            status='error',
+            score=0,
+            max_score=weight,
+            message=f'Falha ao compilar {test_bin}.',
+            test_code=f'make {test_bin}',
+            duration=elapsed_ms(compile_start),
+            raw_score=0,
+        )
+
+    print(f'Executando ./{test_bin}...', flush=True)
+    start_time = time.monotonic()
+    try:
+        completed = run(
+            [f'./{test_bin}'],
+            timeout=timeout,
+            check=False,
+        )
+        duration = elapsed_ms(start_time)
+    except TimeoutExpired:
+        duration = elapsed_ms(start_time)
+        print(f"TIMEOUT: o teste demorou mais que o limite de {timeout} segundos", flush=True)
+        return generate_test_result(
+            name=test,
+            status='error',
+            score=0,
+            max_score=weight,
+            message=f'Timeout apos {timeout} segundos.',
+            test_code=f'./{test_bin}',
+            duration=duration,
+            raw_score=0,
+        )
+
+    if completed.returncode == 0:
+        print('OK', flush=True)
+        status = 'pass'
+        raw_score = weight
+        message = 'OK'
+    else:
+        print('FAIL', flush=True)
+        status = 'fail'
+        raw_score = 0
+        message = 'FAIL'
+
+    return generate_test_result(
+        name=test,
+        status=status,
+        score=raw_score,
+        max_score=weight,
+        message=message,
+        test_code=f'./{test_bin}',
+        duration=duration,
+        raw_score=raw_score,
+    )
+
+
+def read_stream(filename):
+    with open(filename, encoding='utf-8') as file:
+        return ''.join(line.strip() for line in file)
+
+
+def stream_match_count(expected, obtained):
+    total = max(len(expected), len(obtained))
+    matched = sum(1 for expected_char, obtained_char in zip(expected, obtained) if expected_char == obtained_char)
+    return matched, total
+
+
+def stream_difference_message(expected, obtained, matched, total, raw_score, weight):
+    first_difference = None
+    for index, (expected_char, obtained_char) in enumerate(zip(expected, obtained)):
+        if expected_char != obtained_char:
+            first_difference = index
+            break
+
+    if first_difference is None and len(expected) != len(obtained):
+        first_difference = min(len(expected), len(obtained))
+
+    score_message = f'{matched}/{total} simbolos corretos; nota bruta {raw_score:.3f}/{weight}.'
+    if first_difference is None:
+        return score_message
+
+    context_start = max(0, first_difference - 8)
+    context_end = min(max(len(expected), len(obtained)), first_difference + 9)
+    expected_context = expected[context_start:context_end]
+    obtained_context = obtained[context_start:context_end]
+    return (
+        f'{score_message} Primeira diferenca na posicao {first_difference + 1}. '
+        f'Esperado: {expected_context}; obtido: {obtained_context}.'
+    )
+
+
+def failure_message(output):
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if not lines:
+        return ''
+    return '\n'.join(lines[-6:])
+
+
+def with_integer_scores(results):
+    integer_results = []
+    raw_total = 0.0
+    previous_floor = 0
+
+    for result in results:
+        raw_total += result.pop('_raw_score')
+        next_floor = math.floor(raw_total)
+        result['score'] = next_floor - previous_floor
+        previous_floor = next_floor
+        integer_results.append(result)
+
+    return integer_results
+
+
+def generate_result(status, tests, results):
+    return {
+        'version': 1,
+        'status': status,
+        'max_score': max_score(tests),
+        'tests': without_private_fields(results),
+    }
+
+
+def generate_test_result(name, status, score, max_score, message, test_code, duration, raw_score):
+    return {
+        'name': name,
+        'status': status,
+        'score': score,
+        'max_score': max_score,
+        'message': message,
+        'test_code': test_code,
+        'filename': '',
+        'line_no': 0,
+        'duration': duration,
+        '_raw_score': raw_score,
+    }
+
+
+def without_private_fields(results):
+    cleaned_results = []
+    for result in results:
+        cleaned_results.append({key: value for key, value in result.items() if not key.startswith('_')})
+    return cleaned_results
+
+
+def overall_status(results):
+    statuses = {result['status'] for result in results}
+    if 'error' in statuses:
+        return 'error'
+    if 'fail' in statuses:
+        return 'fail'
+    return 'pass'
+
+
+def max_score(tests):
+    return sum(test[-2] for test in tests)
+
+
+def elapsed_ms(start_time):
+    return int((time.monotonic() - start_time) * 1000)
+
+
+def to_command_value(value):
+    if value is None:
+        return ''
+    if isinstance(value, str):
+        return value
+    return json.dumps(value)
+
+
+def prepare_key_value_message(key, value):
+    delimiter = f'ghadelimiter_{uuid.uuid4()}'
+    converted_value = to_command_value(value)
+
+    if delimiter in key:
+        raise ValueError(f'Unexpected input: name should not contain the delimiter "{delimiter}"')
+    if delimiter in converted_value:
+        raise ValueError(f'Unexpected input: value should not contain the delimiter "{delimiter}"')
+
+    return f'{key}<<{delimiter}{os.linesep}{converted_value}{os.linesep}{delimiter}'
+
+
+def set_output(name, value):
+    file_path = os.getenv('GITHUB_OUTPUT')
+    if file_path:
+        with open(file_path, 'a', encoding='utf-8') as output_file:
+            output_file.write(prepare_key_value_message(name, value))
+            output_file.write(os.linesep)
 
 
 if __name__ == '__main__':

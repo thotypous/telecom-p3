@@ -27,12 +27,12 @@ module mkFrameDelimiter(FrameDelimiter);
         method Action put(Bit#(1) in);
             prev <= in;
             if (inside_frame) begin
-                // detect End of Frame (a long sequence of zeros)
-                if (how_long == 40) begin  // minimum IPG is 47 bit times ~ 47*7 (329) worst case, but noise can occur
+                // Detect the end of frame as a sufficiently long idle-low interval
+                if (how_long == 40) begin  // The minimum IPG is 47 bit times; this shorter threshold tolerates noise
                     inside_frame <= False;
                     strikes <= 0;
                     how_long <= 0;
-                    frameFifo.enq(Invalid);  // we send Invalid to notify End of Frame
+                    frameFifo.enq(Invalid);  // "Invalid" marks the end of the current frame
                 end else begin
                     if (in == 1) begin
                         how_long <= 0;
@@ -43,8 +43,8 @@ module mkFrameDelimiter(FrameDelimiter);
                 end
             end else begin
                 if (in == prev) begin
-                    // detect Start of Frame (preamble) after a sequence of long pulses ("strikes")
-                    if (strikes == 5 && how_long == 2) begin  // adjust phase to start of bit
+                    // Detect the start of frame from repeated preamble-length pulses
+                    if (strikes == 5 && how_long == 2) begin  // Align to the start of the next bit
                         inside_frame <= True;
                         strikes <= 0;
                         how_long <= 0;

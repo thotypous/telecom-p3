@@ -1,6 +1,8 @@
 # Interface Ethernet 10baseT
 
-Nesta prática, vamos implementar um receptor para a camada física de uma rede Ethernet do tipo [10baseT](https://en.wikipedia.org/wiki/10BASE-T). A lógica será capaz de decodificar os sinais elétricos da interface, extrair os bits de dados através da decodificação Manchester, e localizar o início de um quadro Ethernet para então extrair seu conteúdo.
+Nesta prática, vamos transformar a FPGA em uma pequena placa de rede [Ethernet 10baseT](https://en.wikipedia.org/wiki/10BASE-T). A lógica recebe quadros Ethernet diretamente dos sinais elétricos do par diferencial, decodifica Manchester, localiza o início do quadro, envia os bytes recebidos pela UART e transmite respostas ARP simples para participar de uma rede real. O projeto não bufferiza quadros inteiros nem oferece uma interface de envio genérica para o computador, mas implementa o caminho físico de recepção e transmissão necessário para conversar com uma placa Ethernet comum.
+
+Além da recepção, o transmissor deve respeitar a ocupação do meio compartilhado. Antes de transmitir, ele aguarda o canal ficar livre; durante a transmissão, ele detecta colisões, envia uma sequência de jam e tenta novamente após um intervalo de backoff. Esses mecanismos são a base do CSMA/CD usado no Ethernet half-duplex clássico.
 
 ## Dependências
 
@@ -12,84 +14,197 @@ sudo pacman -S bluespec-git bluespec-contrib-git yosys-git nextpnr-git prjapicul
 
 Se você usa outra distribuição, prefixe todos os comandos descritos neste documento com `./run-docker` para executá-los dentro de um container.
 
-## Síntese e execução dos testes
+## Síntese e Testes
 
-Para sintetizar a lógica para FPGA, execute `make`. Para carregar em um kit de desenvolvimento, execute `make load`.
+Para sintetizar a lógica para FPGA, execute:
 
-Os testes desta prática leem uma sequência de bits da entrada padrão e geram uma saída que deve ser comparada com um gabarito. Para facilitar, o script `./run-grader` automatiza a execução de todos os testes com as entradas corretas e verifica se geram as saídas correspondentes.
+```bash
+make
+```
+
+Para carregar o bitstream em uma Tang Nano 9k, execute:
+
+```bash
+make load
+```
+
+Para executar os testes automatizados, use:
+
+```bash
+./run-grader
+```
+
+Os testes de recepção leem sequências de bits da entrada padrão e comparam a saída com arquivos de referência. Os testes de transmissão instanciam o transmissor em simulação e verificam diretamente os sinais gerados, o respeito ao canal ocupado, a detecção de colisão, o jam e o backoff.
 
 ## Implementação
 
-As partes do código que estão faltando são descritas a seguir. Elas são independentes e não precisam ser implementadas em nenhuma ordem particular.
+As partes que devem ser implementadas estão marcadas com `TODO` no código. Os registradores já declarados em cada módulo são sugestões de estado interno; você pode alterá-los se preferir outra organização.
 
 ### ManchesterDecoder
 
-Implemente o módulo [mkManchesterDecoder](ManchesterDecoder.bsv), que deve receber como entrada um fluxo de bits amostrados a 81 MHz e produzir como saída os bits de dados correspondentes após a decodificação [Manchester](https://en.wikipedia.org/wiki/Manchester_code).
+Implemente o módulo [mkManchesterDecoder](ManchesterDecoder.bsv), que recebe o fluxo de amostras produzido pelo [mkFrameDelimiter](FrameDelimiter.bsv) e produz os bits decodificados por Manchester.
 
 ![](fig/manchester.svg)
 
-Os dados em uma rede 10baseT são transmitidos a 10 Mbit/s. Como nosso sinal é amostrado a 81 MHz, cada bit de dados (símbolo) corresponde a aproximadamente 8 amostras (`81 MHz / 10 Mbit/s ≈ 8.1`). Pequenas diferenças entre os clocks do transmissor e do receptor podem fazer com que essa quantidade varie entre 7 e 9 amostras.
+Os dados em uma rede 10baseT são transmitidos a 10 Mbit/s. Como nosso sinal é amostrado a 81 MHz, cada bit de dados corresponde a aproximadamente 8 amostras (`81 MHz / 10 Mbit/s ≈ 8.1`). Pequenas diferenças entre os clocks do transmissor e do receptor podem fazer com que essa quantidade varie entre 7 e 9 amostras.
 
-Na amostra central do símbolo (representada pelo tracejado verde na figura), **sempre** ocorre uma transição do sinal. Essa transição é de `0` para `1` se o bit original for `1`, ou de `1` para `0` se o bit original for `0`. Nosso decodificador deve localizar essas transições e produzir um bit de saída para cada uma delas.
+Na região central de cada símbolo Manchester sempre ocorre uma transição. Essa transição é de `0` para `1` quando o bit transmitido é `1`, ou de `1` para `0` quando o bit transmitido é `0`. Também podem existir transições na fronteira entre símbolos consecutivos; essas transições servem para manter o alinhamento, mas não correspondem a novos bits.
 
-Na amostra inicial do símbolo, pode ocorrer uma transição que devemos ignorar (ou seja, não devemos produzir saída nenhuma quando ela acontecer). Essas transições acontecem sempre que há sequências de bits iguais na entrada original, e estão representadas pelo tracejado cinza na figura.
+Uma forma prática de implementar o decodificador é manter uma estimativa da fase dentro do símbolo. A cada amostra válida, compare o valor atual com o valor anterior para detectar transições. Quando uma transição for observada perto da metade esperada do símbolo, ela deve gerar um bit decodificado. Quando a transição acontecer perto da fronteira entre símbolos, ela deve apenas realinhar a fase, sem gerar saída.
 
-Em resumo, o decodificador deve sincronizar sua fase em todas as transições (tanto nas contornadas por verde quanto nas contornadas por cinza), mas deve produzir saída apenas nas transições representadas por verde (quando a fase indicar que estamos no meio de um símbolo).
+Em resumo, seu decodificador deve:
 
-Ou seja, seu módulo deve:
-1.  Manter um contador de fase para saber se está no início ou no meio de um símbolo. O ideal é que o meio do símbolo ocorra na 4ª amostra de um ciclo de 8.
-2.  A cada transição no sinal de entrada, ajustar seu contador de fase para se realinhar com o clock do transmissor.
-3.  Produzir um bit de saída (`outFifo.enq(Valid(bit))`) apenas quando uma transição ocorrer no meio de um símbolo.
-4.  Ao receber um sinal `Invalid`, que é gerado pelo [mkFrameDelimiter](FrameDelimiter.bsv) para marcar o fim de um quadro, você deve reiniciar o estado do decodificador e repassar esse sinal para a saída (`outFifo.enq(Invalid)`).
+1. Acompanhar o valor anterior da linha para detectar transições.
+2. Manter uma noção de fase para distinguir transições de meio de símbolo de transições entre símbolos.
+3. Realinhar essa fase sempre que uma transição for observada, tolerando pequenas variações no número de amostras por bit.
+4. Emitir exatamente um bit decodificado para cada símbolo Manchester recebido.
+
+O módulo deve emitir `Valid(bit)` para cada bit decodificado. Quando receber `Invalid`, que marca o fim de um quadro, deve reiniciar seu estado interno e repassar `Invalid` para a saída.
 
 [Neste link](https://github.com/ctf-br/ctf-sbseg2024/blob/5e625e52c7160c92b9695fac49d095c96c595d08/seized_photos/private/solver/solve.py#L57-L89) há uma implementação em Python similar ao que este módulo de hardware deve implementar.
 
 ### SFDLocator
 
-Implemente o módulo [mkSFDLocator](SFDLocator.bsv), que recebe os bits decodificados do `mkManchesterDecoder` e localiza o fim do Delimitador de Início de Quadro (SFD - *Start Frame Delimiter*). A saída do módulo deve conter apenas os bits do quadro Ethernet útil, descartando o preâmbulo e o SFD.
+Implemente o módulo [mkSFDLocator](SFDLocator.bsv), que recebe os bits decodificados pelo `mkManchesterDecoder` e localiza o fim do Delimitador de Início de Quadro, ou SFD (*Start Frame Delimiter*).
 
-A estrutura de um [quadro Ethernet](https://en.wikipedia.org/wiki/Ethernet_frame#Structure) começa com:
--   **Preâmbulo (7 bytes):** Uma sequência de bits `1` e `0` alternados. Essa sequência não necessariamente será recebida completa pelo módulo, pois pode ser detectada tardiamente pelo `mkFrameDelimiter`.
--   **SFD (1 byte):** A sequência `10101011`.
+Um quadro Ethernet começa com:
 
-Seu módulo deve processar os bits de entrada e, ao detectar a sequência `11` (que marca o final do SFD), deve começar a passar os bits subsequentes para a saída.
--   Enquanto o SFD não for encontrado, não produza nenhuma saída.
--   Após encontrar a sequência `11`, todos os bits `Valid` seguintes da entrada devem ser repassados como `Valid` na saída.
--   Se a entrada for `Invalid` (usado como marcador de fim de quadro), repasse `Invalid` para a saída e reinicie o estado do módulo para procurar um novo SFD.
+- **Preâmbulo:** 7 bytes com padrão alternado de bits, usado para sincronização.
+- **SFD:** 1 byte que encerra a sincronização e marca o início do quadro Ethernet propriamente dito.
 
-## Teste de bancada
+Os bits chegam ao `mkSFDLocator` já decodificados e na ordem em que aparecem no fio. Durante o preâmbulo, o fluxo observado é alternado. O SFD tem o mesmo padrão alternado no começo, mas termina com dois bits `1` consecutivos. Esse par de `1`s marca que o próximo bit recebido já é parte dos "dados úteis" do quadro Ethernet.
+
+Uma forma simples de implementar o localizador é acompanhar o bit anterior enquanto o SFD ainda não foi encontrado. Antes do SFD, nenhuma saída deve ser produzida. Ao reconhecer o fim do SFD, o módulo passa para um estado em que todo `Valid(bit)` recebido é encaminhado para a saída.
+
+Em resumo, seu localizador deve:
+
+1. Ignorar os bits de preâmbulo e SFD.
+2. Detectar o fim do SFD no fluxo decodificado.
+3. Encaminhar todos os bits válidos que vierem depois do SFD.
+4. Ao receber `Invalid`, encerrar o quadro atual, repassar `Invalid` para a saída e voltar a procurar o SFD do próximo quadro.
+
+### EthernetTx
+
+Implemente os trechos marcados com `TODO` em [mkEthernetTx](EthernetTx.bsv). O quadro transmitido já é montado pelo código fornecido; o objetivo desta prática é completar a codificação física e o comportamento de acesso ao meio.
+
+O transmissor deve codificar cada bit como um símbolo Manchester nos pinos `eth_tx_p` e `eth_tx_n`. Esses pinos formam um par diferencial lógico: durante uma transmissão, eles devem ter valores opostos.
+
+Antes de iniciar uma transmissão, o módulo deve observar `rxActivity`, que indica atividade detectada no receptor. Se o canal estiver ocupado, ou se ainda não tiver permanecido livre pelo intervalo mínimo entre quadros, o transmissor deve permanecer em silêncio.
+
+O sinal `rxActivity` vem do módulo [mkRxActivityDetector](RxActivityDetector.bsv). Como o AFE desta prática é propositalmente simples, esse detector não mede energia analógica do sinal como uma placa Ethernet comercial normalmente faria. Em vez disso, ele procura padrões temporais compatíveis com Manchester para evitar que o piso de ruído seja interpretado como atividade real de recepção.
+
+Se `rxActivity` indicar atividade enquanto uma transmissão local está em andamento, o transmissor deve tratar o evento como colisão. O código fornecido já calcula o intervalo de backoff; complete o comportamento para aguardar esse intervalo antes de tentar transmitir novamente.
+
+## Teste de Bancada
+
+O teste de bancada usa a FPGA como uma interface Ethernet 10baseT simples. Ela recebe quadros do meio físico, imprime os bytes recebidos pela UART e responde a requisições ARP para o endereço IP `10.1.2.3` com o endereço MAC `de:ad:be:ef:ca:fe`.
 
 ![](fig/afe.svg)
 
-Para um teste em hardware, conecte J1 à placa de rede de um computador e conecte J2 a um hub Ethernet 10baseT, para que o hub gere link test pulses (LTPs). O conector J2 é necessário pois esta versão da prática ainda não implementa a parte de transmissão do protocolo Ethernet, assim precisamos que algum outro equipamento gere os LTPs para que o computador acredite que o enlace está de pé.
+### Montagem
 
-Configure a interface de rede do seu computador com um endereço IP fixo, por exemplo `10.1.2.2/24`.
+Conecte o circuito do AFE à Tang Nano 9k conforme o diagrama. Para observar recepção e transmissão com colisões reais, use um hub Ethernet 10baseT half-duplex. Um switch Ethernet comum normalmente não serve para esse experimento, pois isola domínios de colisão.
 
-Gere tráfego na rede e observe a saída na UART. O `Top.bsv` está configurado para desserializar os bits recebidos em bytes e enviá-los para o seu computador via USB.
+Configure um computador no mesmo segmento Ethernet com IP fixo, por exemplo `10.1.2.2/24`. Substitua `enp5s0` nos comandos abaixo pelo nome da sua interface de rede.
 
-Note, no entanto, que o adaptador USB UART da Tang Nano 9k é um FTDI emulado que é um pouco bugado. Para funcionar corretamente, um truque que parece dar certo sempre é, antes de carregar o bitfile na placa (ou seja, antes de fazer `make load`), usar o procedimento a seguir para (pré-)configurar a UART e abrir o picocom em seguida:
+### UART
 
-1.  Execute `stty -F /dev/ttyUSB1 3000000 cs8 -parenb cstopb`.
+Antes de carregar o bitstream, configure a UART da Tang Nano 9k e deixe o terminal aberto:
 
-2.  Execute o picocom e mantenha-o executando durante os seus testes: `picocom -b 3000000 -d 8 -p 1 -y n /dev/ttyUSB1`.
-
-3.  Se você desejar, é possível ler os dados recebidos da UART em formato hexadecimal, o que é útil pois tratam-se de dados binários. Para isso, feche o picocom com `Ctrl+a` seguido de `Ctrl+q`, e execute `hexdump -C /dev/ttyUSB1`.
-
-Para gerar tráfego, há duas formas recomendadas:
-
-1.  O comando `sudo arping -c1 -I enp5s0 10.1.2.3`. Substitua `enp5s0` pelo nome da interface de rede do seu computador. Isso deve gerar uma saída parecida com a seguinte:
-
-```
-00000000  ff ff ff ff ff ff f8 75  a4 7b 23 45 08 06 00 01
-00000010  08 00 06 04 00 01 f8 75  a4 7b 23 45 0a 01 02 02
-00000020  ff ff ff ff ff ff 0a 01  02 03 00 00 00 00 00 00
-00000030  00 00 00 00 00 00 00 00  00 00 00 00 63 bc c4 81
+```bash
+stty -F /dev/ttyUSB1 3000000 cs8 -parenb cstopb
+picocom -b 3000000 -d 8 -p 1 -y n /dev/ttyUSB1
 ```
 
-2.  O comando `sudo arp -s 10.1.2.3 de:ad:be:ef:ca:fe` seguido do comando `poetry run python sender.py` dentro do diretório `software` deste repositório. As mensagens de *lorem ipsum* transmitidas pelo computador devem aparecer dentro dos quadros observados na UART.
+Em outro terminal, carregue a FPGA:
 
-## Trabalhos futuros
+```bash
+make load
+```
 
-Esta é uma versão preliminar da prática. Em ofertas futuras da disciplina, pretendemos desenvolver uma placa de rede completa, capaz de enviar e receber quadros e lidar com problemas de acesso ao meio, como colisão.
+Para visualizar os bytes recebidos em hexadecimal, feche o picocom com `Ctrl+a` seguido de `Ctrl+q` e execute:
 
-Acompanhe este repositório para conhecer as próximas edições!
+```bash
+hexdump -C /dev/ttyUSB1
+```
+
+### ARP
+
+Com a FPGA carregada, envie uma única requisição ARP para o IP implementado pelo projeto:
+
+```bash
+sudo arping -c1 -I enp5s0 10.1.2.3
+```
+
+A FPGA deve receber o quadro ARP, imprimir seus bytes pela UART e transmitir uma resposta ARP. O `arping` deve indicar uma resposta vinda de `de:ad:be:ef:ca:fe`.
+
+Para observar várias respostas ARP em sequência, execute o `arping` sem limitar o número de pacotes:
+
+```bash
+sudo arping -I enp5s0 10.1.2.3
+```
+
+Uma saída típica é:
+
+```text
+ARPING 10.1.2.3 from 10.1.2.2 enp5s0
+Unicast reply from 10.1.2.3 [DE:AD:BE:EF:CA:FE]  0.708ms
+Unicast reply from 10.1.2.3 [DE:AD:BE:EF:CA:FE]  0.725ms
+Unicast reply from 10.1.2.3 [DE:AD:BE:EF:CA:FE]  0.713ms
+^CSent 3 probes (1 broadcast(s))
+Received 3 response(s)
+```
+
+### Tráfego UDP
+
+Se o transmissor ainda não estiver funcionando, a recepção pode ser testada mesmo assim cadastrando manualmente a entrada ARP esperada no computador:
+
+```bash
+sudo arp -s 10.1.2.3 de:ad:be:ef:ca:fe
+```
+
+Se o transmissor estiver funcionando, o próprio sistema operacional deve resolver o endereço MAC da FPGA por ARP quando o tráfego UDP for enviado. Se o transmissor ainda não estiver funcionando, use a entrada ARP manual acima. Em seguida, inicialize o ambiente Python e execute o gerador de tráfego no diretório `software`:
+
+```bash
+poetry install --no-root
+```
+
+Depois execute:
+
+```bash
+poetry run python sender.py
+```
+
+As mensagens transmitidas pelo computador devem aparecer dentro dos quadros observados na UART.
+
+### CSMA/CD
+
+Para testar CSMA/CD, conecte dois computadores e a FPGA ao mesmo hub 10baseT. Em um computador, deixe o `arping` contínuo:
+
+```bash
+sudo arping -I enp5s0 10.1.2.3
+```
+
+No outro computador, gere tráfego intenso no mesmo domínio de colisão:
+
+```bash
+sudo arp-scan -i 1u -I enp3s0 10.1.2.0/24
+```
+
+Durante o `arp-scan`, o LED de colisão do hub deve acender em alguns momentos. Mesmo assim, o `arp-scan` deve encontrar o outro computador e a FPGA, e o `arping` deve continuar recebendo respostas. Ao interromper o `arping` com `Ctrl+C`, confira se os contadores `Sent` e `Received` permanecem iguais ou muito próximos; isso indica que carrier sense, collision detect, jam, backoff e retry estão funcionando em conjunto.
+
+## Troubleshooting
+
+O template já monta o quadro ARP no formato esperado e calcula o FCS corretamente. Portanto, se sua implementação de transmissão passa nos testes unitários, não é esperado que você tenha problemas de FCS no teste de bancada.
+
+A dica abaixo é útil apenas se você fizer mudanças mais profundas no transmissor, por exemplo para preparar uma demonstração diferente para o seminário final da disciplina. Nesse caso, se a placa de rede do computador estiver descartando quadros antes que eles cheguem ao Wireshark ou ao tcpdump, pode ser difícil observar quadros com FCS incorreto. Para pedir que a interface entregue também esses quadros ao sistema operacional, tente habilitar `rx-fcs` e `rx-all`:
+
+```bash
+sudo ethtool -K enp5s0 rx-fcs on rx-all on
+```
+
+Nem todas as placas ou drivers suportam essas opções. Verifique os recursos disponíveis com:
+
+```bash
+sudo ethtool -k enp5s0
+```

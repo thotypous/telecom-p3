@@ -6,10 +6,10 @@ all: project.fs
 
 TESTS := $(wildcard Test*.bsv)
 $(TESTS:.bsv=.exe): $(wildcard *.bsv)
-	bsc -u -check-assert -verilog -vsim verilator "$(@:.exe=).bsv" && bsc -verilog -vsim verilator -e "mk$(@:.exe=)" -o "$@"
+	bsc -u -check-assert -system-verilog-tasks -verilog -aggressive-conditions -vsim verilator "$(@:.exe=).bsv" && bsc -verilog -vsim verilator -e "mk$(@:.exe=)" -o "$@"
 
 mkTop.v: $(wildcard *.bsv)
-	bsc -p +:%/Libraries/FPGA/Misc/ -u -verilog -show-module-use Top.bsv
+	bsc -p +:%/Libraries/FPGA/Misc/ -u -verilog -aggressive-conditions -show-module-use Top.bsv
 
 # Synthesis
 project.json: top.v mkTop.v
