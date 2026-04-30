@@ -40,6 +40,8 @@ Os testes de recepção leem sequências de bits da entrada padrão e comparam a
 
 As partes que devem ser implementadas estão marcadas com `TODO` no código. Os registradores já declarados em cada módulo são sugestões de estado interno; você pode alterá-los se preferir outra organização.
 
+**Atenção aos clocks:** o `mkTop` e os módulos do caminho de recepção (`FrameDelimiter`, `ManchesterDecoder`, `SFDLocator` e `RxActivityDetector`) rodam no clock principal de 81 MHz. Já o `mkEthernetTx` é instanciado no `clk_tx`, de 20,25 MHz. Portanto, os contadores de tempo não usam a mesma unidade nos dois lados: no RX, um bit de 10baseT aparece como cerca de 8 amostras; no TX, um bit Manchester ocupa 2 ciclos de `clk_tx`, um ciclo para cada metade do símbolo.
+
 ### ManchesterDecoder
 
 Implemente o módulo [mkManchesterDecoder](ManchesterDecoder.bsv), que recebe o fluxo de amostras produzido pelo [mkFrameDelimiter](FrameDelimiter.bsv) e produz os bits decodificados por Manchester.
